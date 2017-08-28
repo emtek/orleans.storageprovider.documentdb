@@ -1,5 +1,6 @@
 ﻿using Microsoft.Azure.Documents;
 using Microsoft.Azure.Documents.Client;
+using Newtonsoft.Json;
 using Orleans.Runtime;
 using Orleans.Storage;
 using System;
@@ -16,11 +17,11 @@ namespace Orleans.StorageProvider.DocumentDB
     // TODO: extension method for registering the provider
 
 
-    class DocumentDBStorageProvider : IStorageProvider
+    public class DocumentDBStorageProvider : IStorageProvider
     {
         private string databaseName;
         private string collectionName;
-
+        private int throughput;
         public string Name { get; set; }
         public Logger Log { get; set; }
 
@@ -30,25 +31,26 @@ namespace Orleans.StorageProvider.DocumentDB
         {
             try
             {
-                this.Name = name;
+                Name = name;
                 var url = config.Properties["Url"];
                 var key = config.Properties["Key"];
-                this.databaseName = config.Properties["Database"];
-                this.collectionName = config.Properties["Collection"];
+                databaseName = config.Properties["Database"];
+                collectionName = config.Properties["Collection"];
+                throughput = int.Parse(config.Properties["Throughput"]);
                 
-                this.Client = new DocumentClient(new Uri(url), key);
+                Client = new DocumentClient(new Uri(url), key);
 
-                await this.Client.CreateDatabaseAsync(new Database { Id = this.databaseName });
-
+                await Client.CreateDatabaseIfNotExistsAsync(new Database { Id = this.databaseName });
+                
                 var myCollection = new DocumentCollection
                 {
-                    Id = this.collectionName
+                    Id = collectionName
                 };
-                await this.Client.CreateDocumentCollectionAsync(
-                    UriFactory.CreateDatabaseUri(this.databaseName),
+                await Client.CreateDocumentCollectionIfNotExistsAsync(
+                    UriFactory.CreateDatabaseUri(databaseName),
                     myCollection,
-                    new RequestOptions { /*OfferThroughput = 20000 */});
-
+                    new RequestOptions { OfferThroughput = throughput});
+                
             }
             catch (Exception ex)
             {
@@ -59,31 +61,35 @@ namespace Orleans.StorageProvider.DocumentDB
 
         public Task Close()
         {
-            if (null != this.Client) this.Client.Dispose();
+            if (null != Client) Client.Dispose();
 
-            return TaskDone.Done;
+            return Task.CompletedTask;
         }
 
-        Uri GenerateUri(string grainType, GrainReference reference)
+        string GetDocumentId(string grainType, GrainReference reference)
         {
-            return UriFactory.CreateDocumentUri(databaseName, collectionName, reference.ToKeyString());
+            var id = reference.GetPrimaryKey(out string extension);
+           
+            return $"{grainType}-{id}{extension}"; 
         }
 
         public async Task ReadStateAsync(string grainType, GrainReference grainReference, IGrainState grainState)
         {
             try
             {
-
-                var uri = GenerateUri(grainType, grainReference);
-                Document readDoc = await this.Client.ReadDocumentAsync(uri);
+                var uri = UriFactory.CreateDocumentUri(databaseName,collectionName,
+                    GetDocumentId(grainState.State.GetType().Name, grainReference));
+                Document readDoc = await Client.ReadDocumentAsync(uri);
 
                 if (null != readDoc)
                 {
                     grainState.ETag = readDoc.ETag;
-                    grainState.State = readDoc.GetPropertyValue<object>("state");
+                    grainState.State = JsonConvert.DeserializeObject(readDoc.ToString(), 
+                        grainState.State.GetType());
                 }
-
             }
+            catch(DocumentClientException dc) when 
+            (dc.StatusCode == System.Net.HttpStatusCode.NotFound){ /*not found is ok*/  }
             catch (Exception ex)
             {
                 Log.Error(0, "Error in ReadStateAsync", ex);
@@ -95,22 +101,22 @@ namespace Orleans.StorageProvider.DocumentDB
         {
             try
             {
-                var uri = GenerateUri(grainType, grainReference);
-                var document = new Document();
-
-                document.SetPropertyValue("state", grainState.State);
-
+                var uri = UriFactory.CreateDocumentUri(databaseName, collectionName,
+                    GetDocumentId(grainState.State.GetType().Name, grainReference));
+                var document = grainState.State;
+                
                 if (null != grainState.ETag)
                 {
-                    var ac = new AccessCondition { Condition = grainState.ETag, Type = AccessConditionType.IfMatch };
-                    await this.Client.ReplaceDocumentAsync(uri, document, new RequestOptions { AccessCondition = ac });
+                    var ac = new AccessCondition {
+                        Condition = grainState.ETag,
+                        Type = AccessConditionType.IfMatch };
+                    await Client.ReplaceDocumentAsync(uri, document, new RequestOptions { AccessCondition = ac });
                 }
                 else
                 {
-                    Document newDoc = await this.Client.CreateDocumentAsync(uri, document);
+                    Document newDoc = await Client.CreateDocumentAsync(UriFactory.CreateDocumentCollectionUri(databaseName, collectionName), document);
                     grainState.ETag = newDoc.ETag;
                 }
-
             }
             catch (Exception ex)
             {
@@ -123,8 +129,9 @@ namespace Orleans.StorageProvider.DocumentDB
         {
             try
             {
-                var uri = GenerateUri(grainType, grainReference);
-                await this.Client.DeleteDocumentAsync(uri);
+                var uri = UriFactory.CreateDocumentUri(databaseName,collectionName,
+                    GetDocumentId(grainState.State.GetType().Name, grainReference));
+                await Client.DeleteDocumentAsync(uri);
                 grainState.State = null;
                 grainState.ETag = null;
             }
